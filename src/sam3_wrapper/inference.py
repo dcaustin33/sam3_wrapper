@@ -27,7 +27,7 @@ class SegmentationResult:
     masks: list[np.ndarray]
     boxes: list[np.ndarray]
     scores: list[float]
-    image: Image.Image | None = field(default=None, repr=False)
+    image: Image.Image | None = field(default=None, repr=False)  # may be RGB or RGBA
 
     @property
     def num_masks(self) -> int:
@@ -51,14 +51,20 @@ def _collect_images(path: str | Path) -> list[Path]:
 def _apply_mask_as_alpha(image: Image.Image, mask: np.ndarray) -> Image.Image:
     """Apply a binary mask as the alpha channel of an image.
 
+    Any existing alpha channel on the input image is discarded and
+    replaced by the mask. The RGB pixel data is preserved as-is.
+
     Args:
-        image: RGB PIL Image.
+        image: PIL Image (RGB or RGBA). If RGBA, the existing alpha is
+            stripped and overridden by the mask.
         mask: Boolean or uint8 mask array (H, W).
 
     Returns:
         RGBA PIL Image where the alpha channel is the mask.
     """
-    rgba = image.convert("RGBA")
+    # Strip any existing alpha so we start from clean RGB data
+    rgb = image.convert("RGB")
+    rgba = rgb.convert("RGBA")
     alpha = (mask.astype(np.uint8) * 255)
     alpha_img = Image.fromarray(alpha, mode="L")
     rgba.putalpha(alpha_img)
@@ -127,7 +133,9 @@ class Sam3Segmenter:
         Run text-prompted segmentation on a single image.
 
         Args:
-            image: Path to an image file, or a PIL Image.
+            image: Path to an image file, or a PIL Image (RGB or RGBA).
+                If the image has an alpha channel it is stripped for inference
+                but preserved on the result for alpha-aware saving.
             text: Text prompt describing the object to segment (e.g. "a man").
             threshold: Override the default detection confidence threshold.
             mask_threshold: Override the default mask binarization threshold.
@@ -140,13 +148,16 @@ class Sam3Segmenter:
 
         if isinstance(image, (str, Path)):
             image_path = str(image)
-            pil_image = Image.open(image_path).convert("RGB")
+            pil_image = Image.open(image_path)
         else:
             image_path = "<PIL.Image>"
-            pil_image = image.convert("RGB")
+            pil_image = image
+
+        # The model needs RGB; keep the original for alpha-aware saving
+        rgb_image = pil_image.convert("RGB")
 
         inputs = self._processor(
-            images=pil_image,
+            images=rgb_image,
             text=text,
             return_tensors="pt",
         ).to(self.device)
@@ -171,7 +182,7 @@ class Sam3Segmenter:
             masks=masks,
             boxes=boxes,
             scores=scores,
-            image=pil_image,
+            image=pil_image,  # preserves original mode (RGB or RGBA)
         )
 
     def predict_directory(
