@@ -1,0 +1,55 @@
+[project]
+name = "sam3-wrapper"
+version = "0.1.0"
+description = "A convenient wrapper for Meta's SAM 3 text-prompted image segmentation"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    # Core ML
+    "torch>=2.7",
+    "torchvision>=0.22",
+
+    # SAM3 model via HuggingFace transformers
+    "transformers>=4.52",
+    "huggingface-hub>=0.20",
+
+    # Image processing
+    "Pillow>=10.0",
+    "numpy>=1.26,<2",
+    "opencv-python>=4.8",
+
+    # Utilities
+    "tqdm>=4.65",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "black>=23.0",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+sam3-setup = "sam3_wrapper.download:cli_setup"
+sam3-download = "sam3_wrapper.download:cli_download"
+sam3-infer = "sam3_wrapper.inference:cli_infer"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sam3_wrapper"]
+
+[tool.uv]
+index-strategy = "unsafe-best-match"
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
