@@ -1,0 +1,57 @@
+[project]
+name = "sam3-wrapper"
+version = "0.1.0"
+description = "Text-prompted image segmentation: provide images and a text prompt, get back masks using Grounding DINO + SAM 2"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # Core ML
+    "torch>=2.3.1",
+    "torchvision>=0.18.1",
+
+    # Grounding DINO (auto-downloads from HuggingFace)
+    "transformers>=4.40.0",
+
+    # Image processing
+    "numpy>=1.24.0",
+    "Pillow>=10.0.0",
+    "opencv-python>=4.8.0",
+
+    # Visualization
+    "supervision>=0.18.0",
+
+    # Utilities
+    "tqdm>=4.60.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4.0",
+]
+
+[project.scripts]
+sam3-setup = "sam3_wrapper.download:cli_setup"
+sam3-infer = "sam3_wrapper.inference:cli_infer"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sam3_wrapper"]
+
+[tool.uv]
+# PyTorch CUDA 12.4 index. Adjust for your CUDA version:
+#   cu121 -> https://download.pytorch.org/whl/cu121
+#   cpu   -> https://download.pytorch.org/whl/cpu
+index-strategy = "unsafe-best-match"
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
