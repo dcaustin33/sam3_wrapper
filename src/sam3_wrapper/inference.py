@@ -9,6 +9,7 @@ import argparse
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 from PIL import Image
@@ -46,6 +47,13 @@ def _collect_images(path: str | Path) -> list[Path]:
                 files.append(f)
         return files
     raise FileNotFoundError(f"Path does not exist: {path}")
+
+
+def _erode_mask(mask: np.ndarray, pixels: int) -> np.ndarray:
+    """Erode a binary mask inward by a given number of pixels."""
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (pixels * 2 + 1, pixels * 2 + 1))
+    eroded = cv2.erode(mask.astype(np.uint8), kernel, iterations=1)
+    return eroded.astype(mask.dtype)
 
 
 def _apply_mask_as_alpha(image: Image.Image, mask: np.ndarray) -> Image.Image:
@@ -162,7 +170,7 @@ class Sam3Segmenter:
             return_tensors="pt",
         ).to(self.device)
 
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast(self.device):
             outputs = self._model(**inputs)
 
         results = self._processor.post_process_instance_segmentation(
@@ -194,6 +202,7 @@ class Sam3Segmenter:
         mask_threshold: float | None = None,
         save_masks: bool = True,
         save_alpha: bool = False,
+        erode_pixels: int = 0,
     ) -> list[SegmentationResult]:
         """
         Run text-prompted segmentation on a directory of images.
@@ -207,6 +216,7 @@ class Sam3Segmenter:
             save_masks: Save binary mask images to output_dir.
             save_alpha: Save the input image with the mask applied as
                 the alpha channel (RGBA PNG).
+            erode_pixels: Shrink masks inward by this many pixels (default: 0).
 
         Returns:
             List of SegmentationResult, one per input image.
@@ -235,7 +245,7 @@ class Sam3Segmenter:
             results.append(result)
 
             if output_dir is not None and result.num_masks > 0:
-                self._save_results(result, output_dir, img_path.stem, save_masks, save_alpha)
+                self._save_results(result, output_dir, img_path.stem, save_masks, save_alpha, erode_pixels)
 
         total_masks = sum(r.num_masks for r in results)
         print(f"Done: {len(results)} images, {total_masks} masks found.")
@@ -248,30 +258,35 @@ class Sam3Segmenter:
         image_name: str,
         save_masks: bool,
         save_alpha: bool,
+        erode_pixels: int = 0,
     ) -> None:
         """Save mask outputs for a single image."""
+        masks = result.masks
+        if erode_pixels > 0:
+            masks = [_erode_mask(m, erode_pixels) for m in masks]
+
+        if save_alpha and result.image is not None and masks:
+            # Save only the RGBA image with the original filename
+            union_mask = np.zeros_like(masks[0], dtype=bool)
+            for mask in masks:
+                union_mask |= mask.astype(bool)
+            alpha_img = _apply_mask_as_alpha(result.image, union_mask)
+            alpha_img.save(output_dir / f"{image_name}.png")
+            return
+
         if save_masks:
             # Combine all masks into a single mask image
-            if result.masks:
-                combined = np.zeros_like(result.masks[0], dtype=np.uint8)
-                for i, mask in enumerate(result.masks):
-                    combined[mask > 0] = (i + 1) * (255 // max(len(result.masks), 1))
+            if masks:
+                combined = np.zeros_like(masks[0], dtype=np.uint8)
+                for i, mask in enumerate(masks):
+                    combined[mask > 0] = (i + 1) * (255 // max(len(masks), 1))
                 mask_img = Image.fromarray(combined, mode="L")
                 mask_img.save(output_dir / f"{image_name}_mask.png")
 
             # Also save individual masks
-            for i, mask in enumerate(result.masks):
+            for i, mask in enumerate(masks):
                 mask_img = Image.fromarray((mask.astype(np.uint8) * 255), mode="L")
                 mask_img.save(output_dir / f"{image_name}_mask_{i}.png")
-
-        if save_alpha and result.image is not None:
-            # Union of all masks as alpha
-            if result.masks:
-                union_mask = np.zeros_like(result.masks[0], dtype=bool)
-                for mask in result.masks:
-                    union_mask |= mask.astype(bool)
-                alpha_img = _apply_mask_as_alpha(result.image, union_mask)
-                alpha_img.save(output_dir / f"{image_name}_alpha.png")
 
 
 def cli_infer() -> None:
@@ -326,6 +341,12 @@ def cli_infer() -> None:
         help="Save input images with mask as alpha channel (RGBA PNG)",
     )
     parser.add_argument(
+        "--erode-pixels",
+        type=int,
+        default=0,
+        help="Shrink masks inward by this many pixels (default: 0)",
+    )
+    parser.add_argument(
         "--checkpoint-path",
         type=str,
         default=None,
@@ -346,4 +367,5 @@ def cli_infer() -> None:
         output_dir=args.output,
         save_masks=not args.no_masks,
         save_alpha=args.alpha,
+        erode_pixels=args.erode_pixels,
     )
