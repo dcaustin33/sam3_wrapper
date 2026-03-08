@@ -6,8 +6,11 @@ using text prompts to segment objects in images.
 """
 
 import argparse
+import logging
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
+from queue import Queue
 
 import cv2
 import numpy as np
@@ -15,6 +18,8 @@ import torch
 from PIL import Image
 
 from sam3_wrapper.download import HF_REPO_ID, get_checkpoint_path, verify_checkpoint
+
+logger = logging.getLogger(__name__)
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp", ".gif"}
 
@@ -77,6 +82,49 @@ def _apply_mask_as_alpha(image: Image.Image, mask: np.ndarray) -> Image.Image:
     alpha_img = Image.fromarray(alpha, mode="L")
     rgba.putalpha(alpha_img)
     return rgba
+
+
+class _BackgroundSaver:
+    """Offloads image encoding and disk I/O to a pool of daemon worker threads.
+
+    Uses a bounded queue so the main (GPU) thread is not blocked by PNG
+    encoding while still applying back-pressure if saves fall behind.
+    """
+
+    def __init__(self, num_workers: int = 4, maxsize: int = 100):
+        self._queue: Queue = Queue(maxsize=maxsize)
+        self._threads = []
+        for _ in range(num_workers):
+            t = threading.Thread(target=self._worker, daemon=True)
+            t.start()
+            self._threads.append(t)
+
+    def _worker(self) -> None:
+        while True:
+            fn = self._queue.get()
+            if fn is None:
+                self._queue.task_done()
+                break
+            try:
+                fn()
+            except Exception:
+                logger.exception("Background image save failed")
+            self._queue.task_done()
+
+    def submit(self, fn) -> None:
+        self._queue.put(fn)
+
+    def flush(self) -> None:
+        """Block until all queued saves complete."""
+        self._queue.join()
+
+    def shutdown(self) -> None:
+        """Stop all worker threads. Safe to call multiple times."""
+        for _ in self._threads:
+            self._queue.put(None)
+        for t in self._threads:
+            t.join(timeout=60)
+        self._threads.clear()
 
 
 class Sam3Segmenter:
@@ -193,6 +241,73 @@ class Sam3Segmenter:
             image=pil_image,  # preserves original mode (RGB or RGBA)
         )
 
+    def predict_batch(
+        self,
+        images: list[str | Path | Image.Image],
+        text: str,
+        threshold: float | None = None,
+        mask_threshold: float | None = None,
+    ) -> list[SegmentationResult]:
+        """
+        Run text-prompted segmentation on a batch of images in a single forward pass.
+
+        Args:
+            images: List of image paths or PIL Images.
+            text: Text prompt describing the object to segment.
+            threshold: Override detection confidence threshold.
+            mask_threshold: Override mask binarization threshold.
+
+        Returns:
+            List of SegmentationResult, one per input image.
+        """
+        thr = threshold if threshold is not None else self.threshold
+        mask_thr = mask_threshold if mask_threshold is not None else self.mask_threshold
+
+        pil_images = []
+        image_paths = []
+        for img in images:
+            if isinstance(img, (str, Path)):
+                image_paths.append(str(img))
+                pil_images.append(Image.open(img))
+            else:
+                image_paths.append("<PIL.Image>")
+                pil_images.append(img)
+
+        rgb_images = [img.convert("RGB") for img in pil_images]
+        texts = [text] * len(rgb_images)
+
+        inputs = self._processor(
+            images=rgb_images,
+            text=texts,
+            return_tensors="pt",
+        ).to(self.device)
+
+        with torch.no_grad(), torch.autocast(self.device):
+            outputs = self._model(**inputs)
+
+        batch_results = self._processor.post_process_instance_segmentation(
+            outputs,
+            threshold=thr,
+            mask_threshold=mask_thr,
+            target_sizes=inputs.get("original_sizes").tolist(),
+        )
+
+        results = []
+        for i, res in enumerate(batch_results):
+            masks = [m.cpu().numpy() for m in res["masks"]]
+            boxes = [b.cpu().numpy() for b in res["boxes"]]
+            scores = [s.item() for s in res["scores"]]
+            results.append(SegmentationResult(
+                image_path=image_paths[i],
+                text_prompt=text,
+                masks=masks,
+                boxes=boxes,
+                scores=scores,
+                image=pil_images[i],
+            ))
+
+        return results
+
     def predict_directory(
         self,
         images_path: str | Path,
@@ -203,6 +318,7 @@ class Sam3Segmenter:
         save_masks: bool = True,
         save_alpha: bool = False,
         erode_pixels: int = 0,
+        batch_size: int = 1,
     ) -> list[SegmentationResult]:
         """
         Run text-prompted segmentation on a directory of images.
@@ -217,6 +333,7 @@ class Sam3Segmenter:
             save_alpha: Save the input image with the mask applied as
                 the alpha channel (RGBA PNG).
             erode_pixels: Shrink masks inward by this many pixels (default: 0).
+            batch_size: Number of images to process per forward pass (default: 1).
 
         Returns:
             List of SegmentationResult, one per input image.
@@ -228,24 +345,38 @@ class Sam3Segmenter:
             print(f"No images found at {images_path}")
             return []
 
-        print(f"Processing {len(image_files)} images with prompt: '{text}' ...")
+        print(f"Processing {len(image_files)} images with prompt: '{text}' (batch_size={batch_size}) ...")
 
         if output_dir is not None:
             output_dir = Path(output_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
 
-        results = []
-        for img_path in tqdm(image_files, desc="Segmenting"):
-            result = self.predict(
-                img_path,
-                text=text,
-                threshold=threshold,
-                mask_threshold=mask_threshold,
-            )
-            results.append(result)
+        bg_saver = _BackgroundSaver() if output_dir is not None else None
 
-            if output_dir is not None and result.num_masks > 0:
-                self._save_results(result, output_dir, img_path.stem, save_masks, save_alpha, erode_pixels)
+        results = []
+        batches = [image_files[i:i + batch_size] for i in range(0, len(image_files), batch_size)]
+        pbar = tqdm(total=len(image_files), desc="Segmenting")
+        for batch in batches:
+            if len(batch) == 1:
+                batch_results = [self.predict(
+                    batch[0], text=text, threshold=threshold, mask_threshold=mask_threshold,
+                )]
+            else:
+                batch_results = self.predict_batch(
+                    batch, text=text, threshold=threshold, mask_threshold=mask_threshold,
+                )
+            for result, img_path in zip(batch_results, batch):
+                results.append(result)
+                if output_dir is not None and result.num_masks > 0:
+                    bg_saver.submit(lambda r=result, d=output_dir, n=img_path.stem: (
+                        self._save_results(r, d, n, save_masks, save_alpha, erode_pixels)
+                    ))
+            pbar.update(len(batch))
+        pbar.close()
+
+        if bg_saver is not None:
+            bg_saver.flush()
+            bg_saver.shutdown()
 
         total_masks = sum(r.num_masks for r in results)
         print(f"Done: {len(results)} images, {total_masks} masks found.")
@@ -352,6 +483,12 @@ def cli_infer() -> None:
         default=None,
         help="Path to local model checkpoint directory",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Number of images per forward pass (default: 1)",
+    )
     args = parser.parse_args()
 
     model = Sam3Segmenter(
@@ -368,4 +505,5 @@ def cli_infer() -> None:
         save_masks=not args.no_masks,
         save_alpha=args.alpha,
         erode_pixels=args.erode_pixels,
+        batch_size=args.batch_size,
     )
