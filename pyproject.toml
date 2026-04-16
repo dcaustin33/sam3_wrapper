@@ -3,12 +3,11 @@ name = "sam3-wrapper"
 version = "0.1.0"
 description = "A convenient wrapper for Meta's SAM 3 text-prompted image segmentation"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
-    # Core ML — pinned to versions available on the pytorch-cu126 index
-    # (kept in sync with sam3d_wrapper so both can be installed together).
-    "torch>=2.6",
-    "torchvision>=0.21",
+    # Core ML
+    "torch>=2.0",
+    "torchvision>=0.15",
     # SAM3 model via HuggingFace transformers
     "transformers>=4.40",
     "huggingface-hub>=0.20",
@@ -43,12 +42,3 @@ packages = ["src/sam3_wrapper"]
 [tool.uv]
 index-strategy = "unsafe-best-match"
 environments = ["sys_platform == 'linux'"]
-
-[[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
-explicit = true
-
-[tool.uv.sources]
-torch = { index = "pytorch-cu126" }
-torchvision = { index = "pytorch-cu126" }
