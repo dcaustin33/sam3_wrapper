@@ -3,7 +3,7 @@ name = "sam3-wrapper"
 version = "0.1.0"
 description = "A convenient wrapper for Meta's SAM 3 text-prompted image segmentation"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     # Core ML
     "torch>=2.0",
